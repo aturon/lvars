@@ -1,6 +1,7 @@
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE TemplateHaskell #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 module Main where
 
@@ -64,10 +65,26 @@ assertException msgs action = do
    else error $ "Got the wrong exception, expected one of the strings: "++ show msgs
         ++ "\nInstead got this exception:\n  " ++ show s
 
+-- | A test which may c
+maybeException :: [String] -> IO () -> IO (Maybe SomeException)
+maybeException msgs action = do
+ x <- catch (do action; return Nothing) 
+            (\e -> do putStrLn $ "Good.  Caught exception: " ++ show (e :: SomeException)
+                      return (Just $ show e))
+ case x of 
+  Nothing -> error "Failed to get an exception!"
+  Just s -> 
+   if  any (`isInfixOf` s) msgs
+   then return () 
+   else error $ "Got the wrong exception, expected one of the strings: "++ show msgs
+        ++ "\nInstead got this exception:\n  " ++ show s
+
 
 -- TODO:
 assertOr :: Assertion -> Assertion -> Assertion
-assertOr = error "TODO: Disjunction over assertions..." 
+assertOr act1 act2 = 
+  catch act1 
+        (\(e::SomeException) -> act2)
 
 --------------------------------------------------------------------------------
 
@@ -128,8 +145,11 @@ v3 = runParIO $
 -- result OR throw an exception.  In this case it should always return
 -- a list of 10 elements, or throw an exception.
 case_v3b :: Assertion
-case_v3b = v3b >>= assertEqual "under-synchronized"
-           (S.fromList [10,20,30,40,50,60,70,80,90,100] :: S.Set Int)
+case_v3b = 
+  maybeException ["attempt to touch LVar after Consume operation"] $ 
+    do x <- v3b
+       assertEqual "under-synchronized passed through"
+      	           (S.fromList [10,20..100] :: S.Set Int) x
           
 v3b :: IO (S.Set Int)
 v3b = runParIO $
