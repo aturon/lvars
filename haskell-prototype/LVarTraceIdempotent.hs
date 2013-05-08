@@ -44,6 +44,8 @@ import qualified Control.Monad.Par.Class as PC
 
 import           Common (forkWithExceptions)
 
+import qualified Sched as Sched
+
 ------------------------------------------------------------------------------
 -- IVars implemented on top of LVars:
 ------------------------------------------------------------------------------
@@ -115,7 +117,7 @@ instance PC.ParIVar IVar Par where
 -- functions are in the IO monad.
 data LVar a d = LVar {
   lvstate :: a,
-  blocked :: {-# UNPACK #-} !(IORef (M.Map UID Poller)),
+  blocked :: {-# UNPACK #-} !(),
   callback :: Maybe (a -> IO Trace)
 }
 
@@ -124,18 +126,6 @@ data Poller = Poller {
    poll  :: IO (Maybe Trace),
    woken :: {-# UNPACK #-}! (IORef Bool)
 }
-
--- Return the old value.  Could replace with a true atomic op.
-atomicIncr :: IORef Int -> IO Int
-atomicIncr cntr = atomicModifyIORef cntr (\c -> (c+1,c))
-
-type UID = Int
-
-uidCntr :: IORef UID
-uidCntr = unsafePerformIO (newIORef 0)
-
-getUID :: IO UID
-getUID =  atomicIncr uidCntr
 
 ------------------------------------------------------------------------------
 -- Generic scheduler with LVars:
@@ -156,7 +146,7 @@ instance Applicative Par where
    (<*>) = ap
    pure  = return
 
--- | Trying this using only parametric polymorphism:
+-- | Trying this using only parametric polymorphism:   
 data Trace =
   forall a b . Get (LVar a) (IO (Maybe b)) (b -> Trace)
   | forall a . Put (LVar a) (a -> IO ()) Trace
@@ -172,121 +162,86 @@ data Trace =
   -- For debugging:
   | forall a b . Peek (LVar a) (a -> IO b) (b -> Trace)
 
-
 -- | The main scheduler loop.
-sched :: Bool -> Sched -> Trace -> IO ()
-sched _doSync queue t = loop t
+exec :: Sched.Queue Trace -> Trace -> IO ()
+exec queue t = loop t
  where
-
-  -- Try to wake it up and remove from the wait list.  Returns true if
-  -- this was the call that actually removed the entry.
-  tryWake (Poller fn flag) waitmp uid = do
-    b <- atomicModifyIORef flag (\b -> (True,b)) -- CAS would work.
-    case b of
-      True -> return False -- Already woken.
-      False -> do atomicModifyIORef waitmp $ \mp -> (M.delete uid mp, ())
-                  return True 
-        
   loop origt = case origt of
-    New io fn -> do
-      x  <- io
-      ls <- newIORef M.empty
-      loop (fn (LVar x ls Nothing))
+    New init cont -> do
+      ref <- newIORef$ LVarContents init []
+      loop (cont (LVar ref Nothing))
 
-    NewWithCallBack io cont -> do
-      (st0, cb) <- io
-      wait <- newIORef M.empty
-      loop (cont$ LVar st0 wait (Just cb))
+    NewWithCallBack init cb cont -> do
+      ref <- newIORef$ LVarContents init []
+      loop (cont$ LVar ref (Just cb))
 
-    Get (LVar _ waitmp _) poll cont -> do
-      e <- poll
-      case e of         
-         Just a  -> loop (cont a) -- Return straight away.
-         Nothing -> do -- Register on the waitlist:
-           uid <- getUID
-           flag <- newIORef False
-           -- Data-race here: if a putter runs to completion right
-           -- now, it might finish before we get our poller in.  Thus
-           -- we self-poll at the end.
-           let fn = fmap cont <$> poll
-               retry = Poller fn flag
-           atomicModifyIORef waitmp $ \mp -> (M.insert uid retry mp, ())
-           -- We must SELF POLL here to make sure there wasn't a race
-           -- with a putter.  Now we KNOW that our poller is
-           -- "published", so any puts that sneak in here are fine.
-           trc <- fn           
-           case trc of
-             Nothing -> reschedule queue
-             Just tr -> do b <- tryWake retry waitmp uid 
-                           case b of
-                             True  -> loop tr
-                             False -> reschedule queue -- Already woken
+    Get (LVar ref _) thresh cont -> do
+      -- Tradeoff: we could do a plain read before the
+      -- atomicModifyIORef.  But that would require evaluating the
+      -- threshold function TWICE if we need to block.  (Which is
+      -- potentially more expensive than in the plain IVar case.)
+      -- e <- readIORef ref
+      let thisCB x =
+--            trace ("... LVar blocked, thresh attempted "++show(hashStableName$ unsafePerformIO$ makeStableName x))
+            fmap cont $ thresh x
+      r <- atomicModifyIORef ref $ \ st@(LVarContents a ls) ->
+        case thresh a of
+          Just b  -> -- trace ("... LVar get, thresh passed ")
+                     (st, loop (cont b))
+          Nothing -> (LVarContents a (thisCB:ls), reschedule queue)
+      r
 
-    Consume (LVar state waittmp _) extractor cont -> do
+    Consume (LVar ref _) cont -> do
       -- HACK!  We know nothing about the type of state.  But we CAN
-      -- destroy waittmp to prevent any future access.
-      atomicModifyIORef waittmp (\_ -> (error "attempt to touch LVar after Consume operation!", ()))
-      -- CAREFUL: Putters only read waittmp AFTER they do the
-      -- mutation, so this will be a delayed error.  It is recommended
-      -- that higher level interfaces do their own corruption of the
-      -- state in the extractor.
-      result <- extractor state
-      loop (cont result)
-      
-    Peek (LVar state _ _) extractor cont -> do
-      result <- extractor state
-      loop (cont result)
+      -- destroy it to prevent any future access:
+      a <- atomicModifyIORef ref (\(LVarContents a _) ->
+                                   (error "attempt to touch LVar after Consume operation!", a))
+      loop (cont a)
 
-    Put (LVar state waitmp callback) mutator tr -> do
-      -- Here we follow an unfortunately expensive protocol.
-      mutator state
-      -- Inefficiency: we must leave the pollers in the wait list,
-      -- where they may be redundantly evaluated:
-      pollers <- readIORef waitmp
-      -- (Ugh, there doesn't seem to be a M.traverseWithKey_, just for
-      -- effect)
-      forM_ (M.toList pollers) $ \ (uid, pl@(Poller poll _)) -> do
-        -- Here we try to wake ready threads.  TRADEOFF: we could wake
-        -- one at a time (currently), or in a batch:
-        e <- poll
-        case e of
-          Nothing -> return ()
-          Just trc -> do b <- tryWake pl waitmp uid
-                         case b of
-                           True  -> pushWork queue trc
-                           False -> return ()
-      case callback of
-        Nothing -> loop tr
-        Just cb -> do tr2 <- cb state
-                      loop (Fork tr tr2)
+    Peek (LVar ref _) cont -> do
+      LVarContents {current} <- readIORef ref     
+      loop (cont current)
+
+    Put (LVar ref cb) new tr  -> do
+      cs <- atomicModifyIORef ref $ \e -> case e of
+              LVarContents a ls ->
+                let new' = join a new
+                    (ls',woken) = loop ls [] []
+                    loop [] f w = (f,w)
+                    loop (hd:tl) f w =
+                      case hd new' of
+                        Just trc -> loop tl f (trc:w)
+                        Nothing  -> loop tl (hd:f) w
+                    -- Callbacks invoked: 
+                    woken' = case cb of
+                              Nothing -> woken
+                              Just fn -> fn a new' : woken
+                in 
+                deepseq new' (LVarContents new' ls', woken')
+      mapM_ (pushWork queue) cs
+      loop tr              
 
     Fork child parent -> do
-         pushWork queue parent -- "Work-first" policy.
-         loop child
-         -- pushWork queue child -- "Help-first" policy.  Generally bad.
-         -- loop parent
-    Done ->
-         if _doSync
-	 then reschedule queue
-         -- We could fork an extra thread here to keep numCapabilities
-         -- workers even when the main thread returns to the runPar
-         -- caller...
-         else do putStrLn " [par] Forking replacement thread..\n"
-                 forkIO (reschedule queue); return ()
-         -- But even if we don't we are not orphaning any work in this
-         -- thread's work-queue because it can be stolen by other
-         -- threads.
-         --	 else return ()
+      Sched.pushWork queue parent -- "Work-first" policy.
+      loop child
+      -- Sched.pushWork queue child -- "Help-first" policy.  Generally bad.
+      -- loop parent
+
+    Done -> sched queue
 
     DoIO io t -> io >> loop t
 
-    Yield parent -> do 
-        -- Go to the end of the worklist:
-        let Sched { workpool } = queue
-        -- TODO: Perhaps consider Data.Seq here.  This would also be a
-        -- chance to steal and work from opposite ends of the queue.
-        atomicModifyIORef workpool $ \ts -> (ts++[parent], ())
-	reschedule queue
+    Yield parent -> do
+      Sched.yieldWork queue parent
+      sched queue
+  
+{-# INLINE sched #-}
+sched :: Sched.Queue Trace -> IO ()
+sched q = do
+  n <- Sched.next q
+  case n of
+    Just t  -> exec t >> sched q
+    Nothing -> return ()
 
 -- Forcing evaluation of a LVar is fruitless.
 instance NFData (LVar a) where
@@ -295,21 +250,27 @@ instance NFData (LVar a) where
 {-# INLINE runPar_internal #-}
 runPar_internal :: Par a -> IO a
 runPar_internal c = do
+  queues <- Sched.new numCapabilities  
   
+  -- We create a thread on each CPU with forkOn.  The CPU on which
+  -- the current thread is running will host the main thread; the
+  -- other CPUs will host worker threads.
+  main_cpu <- Sched.currentCPU
+  m <- newEmptyMVar  
+  forM_ (zip [0..] queues) $ \(cpu, s) ->
+    forkWithExceptions (forkOn cpu) "worker thread" $ do
+      when (cpu == main_cpu) $
+        exec s $ runCont (do x' <- x; liftIO (putMVar m x')) (const Done)
+      sched s      
+  takeMVar m  
 
 runPar :: Par a -> a
-runPar = unsafePerformIO . runPar_internal True
+runPar = unsafePerformIO . runPar_internal
 
 -- | A version that avoids an internal `unsafePerformIO` for calling
 -- contexts that are already in the `IO` monad.
 runParIO :: Par a -> IO a
-runParIO = runPar_internal True
-
--- | An asynchronous version in which the main thread of control in a
--- Par computation can return while forked computations still run in
--- the background.  
-runParAsync :: Par a -> a
-runParAsync = unsafePerformIO . runPar_internal False
+runParIO = runPar_internal
 
 --------------------------------------------------------------------------------
 -- Basic stuff:
