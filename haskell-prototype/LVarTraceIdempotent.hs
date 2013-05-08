@@ -291,42 +291,11 @@ sched _doSync queue t = loop t
 -- Forcing evaluation of a LVar is fruitless.
 instance NFData (LVar a) where
   rnf _ = ()
-
+  
 {-# INLINE runPar_internal #-}
-runPar_internal :: Bool -> Par a -> IO a
-runPar_internal _doSync x = do
-   workpools <- replicateM numCapabilities $ newIORef []
-   idle <- newIORef []
-   let states = [ Sched { no=x, workpool=wp, idle, scheds=states }
-                | (x,wp) <- zip [0..] workpools ]
-
-#if __GLASGOW_HASKELL__ >= 701 /* 20110301 */
-    --
-    -- We create a thread on each CPU with forkOn.  The CPU on which
-    -- the current thread is running will host the main thread; the
-    -- other CPUs will host worker threads.
-    --
-    -- Note: GHC 7.1.20110301 is required for this to work, because that
-    -- is when threadCapability was added.
-    --
-   (main_cpu, _) <- threadCapability =<< myThreadId
-#else
-    --
-    -- Lacking threadCapability, we always pick CPU #0 to run the main
-    -- thread.  If the current thread is not running on CPU #0, this
-    -- will require some data to be shipped over the memory bus, and
-    -- hence will be slightly slower than the version above.
-    --
-   let main_cpu = 0
-#endif
-
-   m <- newEmptyMVar
-   forM_ (zip [0..] states) $ \(cpu,state) ->
-        forkWithExceptions (forkOn cpu) "worker thread" $
-          if (cpu /= main_cpu)
-             then reschedule state
-             else sched _doSync state $ runCont (do x' <- x; liftIO (putMVar m x')) (const Done)
-   takeMVar m
+runPar_internal :: Par a -> IO a
+runPar_internal c = do
+  
 
 runPar :: Par a -> a
 runPar = unsafePerformIO . runPar_internal True
