@@ -202,12 +202,12 @@ exec queue t = loop t
       -- in the continuation being executed twice, which is permitted by
       -- idempotence.
           
-      pastThresh <- poll state           
+      pastThresh <- poll state 
       case pastThresh of 
         Just b -> loop (cont b) 
         Nothing -> do
           B.put callbacks thisCB
-          pastTresh' <- poll state -- poll again
+          pastThresh' <- poll state -- poll again
           case pastThresh' of
             Just b -> loop (cont b)  -- TODO: remove callback
             Nothing -> sched queue
@@ -247,7 +247,7 @@ exec queue t = loop t
     AddHandler (cnt, _) (LVar state callbacks frozen) poll callback cont -> do
       let enroll Nothing  = return ()
           enroll (Just t) = do
-            C.inc hp    -- record thread creation
+            C.inc cnt   -- record thread creation
             pushWork t  -- create callback thread, which is responsible for
                         -- recording its termination in hp
       let thisCB q d = do
@@ -261,8 +261,8 @@ exec queue t = loop t
     Quiesce (cnt, cbs) cont -> do
       -- todo: optimize this by checking for quiescence first?  
       -- that's probably the less likely case, though.
-      cbs.put cont 
-      quiescent <- C.poll hp
+      B.put cbs cont 
+      quiescent <- C.poll cnt
       if quiescent
         then loop cont  -- todo: remove callback from bag?
         else sched queue
