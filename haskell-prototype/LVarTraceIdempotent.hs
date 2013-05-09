@@ -36,6 +36,8 @@ import           Control.Applicative
 import           Data.IORef
 import qualified Data.Map as M
 import qualified Data.Set as S
+import qualified Data.Concurrent.Counter as C
+import qualified Data.Concurrent.Bag as B
 import           GHC.Conc hiding (yield)
 import           System.IO.Unsafe (unsafePerformIO)
 import           Prelude  hiding (mapM, sequence, head, tail)
@@ -104,28 +106,15 @@ instance PC.ParIVar IVar Par where
 -- Underlying LVar representation:
 ------------------------------------------------------------------------------
 
--- | An LVar consists of a piece of mutable state, a list of polling
--- functions that produce continuations when they are successful, and
--- an optional callback, triggered after every write to the LVar, that
--- takes the written value as its argument.
--- 
--- This implementation cannot provide scalable LVars (e.g., a
--- concurrent hashmap); rather, accesses to a single LVar will
--- contend.  But even if operations on an LVar are serialized, they
--- cannot all be a single "atomicModifyIORef", because atomic
--- modifications must be pure functions, whereas the LVar polling
--- functions are in the IO monad.
+-- AJT TODO: add commentary
 data LVar a d = LVar {
-  lvstate :: a,
-  blocked :: {-# UNPACK #-} !(),
-  callback :: Maybe (a -> IO Trace)
+  state     :: a,
+  -- to avoid extra allocation, give callback direct access to the local queue
+  callbacks :: B.Bag (Sched.Queue Trace -> d -> IO B.IterAction), 
+  frozen    :: IORef Bool
 }
 
--- A poller can only be removed from the Map when it is woken.
-data Poller = Poller {
-   poll  :: IO (Maybe Trace),
-   woken :: {-# UNPACK #-}! (IORef Bool)
-}
+type HandlerPool = (C.Counter, B.Bag Trace)
 
 ------------------------------------------------------------------------------
 -- Generic scheduler with LVars:
@@ -147,18 +136,42 @@ instance Applicative Par where
    pure  = return
 
 -- | Trying this using only parametric polymorphism:   
-data Trace =
-  forall a b . Get (LVar a) (IO (Maybe b)) (b -> Trace)
-  | forall a . Put (LVar a) (a -> IO ()) Trace
-  | forall a . New (IO a) (LVar a -> Trace)
-  | Fork Trace Trace
-  | Done
-  | DoIO (IO ()) Trace
-  | Yield Trace
+data Trace =  
+  -- Create an LVar
+    forall a d . New (IO a)                     -- initial value
+                     (LVar a -> Trace)          -- continuation
+    
+  -- Treshhold reads from an LVar
+  | forall a b d . Get (LVar a d)               -- the LVar 
+                       (a -> IO (Maybe b))      -- already past threshhold?
+                       (d -> IO (Maybe b))      -- does d pass the threshhold?
+                       (b -> Trace)             -- continuation
+    
+  -- Update an LVar
+  | forall a d . Put (LVar a d)                 -- the LVar
+                     (a -> IO (Maybe d))        -- how to do the put
+                     Trace                      -- continuation
     
   -- Destructively consume the value (limited nondeterminism):
-  | forall a b . Consume (LVar a) (a -> IO b) (b -> Trace)
-    
+  | forall a b . Consume (LVar a)               -- the LVar to consume
+                         (a -> IO b)            -- 
+                         (b -> Trace)           -- 
+  
+  -- Handler pools and handlers
+  | NewHandlerPool (HandlerPool -> trace)
+  | forall a d . AddHandler HandlerPool             -- pool to enroll in
+                            (LVar a d)              -- LVar to listen to
+                            (a -> IO (Maybe Trace)) -- initial callback
+                            (d -> IO (Maybe Trace)) -- subsequent callbaks
+                            Trace                   -- continuation
+  | Quiesce HandlerPool Trace
+  
+  | Fork Trace Trace
+  | Done
+  | HandlerDone HandlerPool
+  | DoIO (IO ()) Trace
+  | Yield Trace
+        
   -- For debugging:
   | forall a b . Peek (LVar a) (a -> IO b) (b -> Trace)
 
@@ -168,58 +181,100 @@ exec queue t = loop t
  where
   loop origt = case origt of
     New init cont -> do
-      ref <- newIORef$ LVarContents init []
-      loop (cont (LVar ref Nothing))
+      state <- init
+      callbacks <- B.new
+      frozen <- newIORef False
+      loop (cont (LVar state callbacks frozen))
 
-    NewWithCallBack init cb cont -> do
-      ref <- newIORef$ LVarContents init []
-      loop (cont$ LVar ref (Just cb))
+    Get (LVar state callbacks frozen) poll callback cont -> do
+      let thisCB q d = do
+        pastThresh <- callback d
+        case pastTresh of
+          Just b -> do
+            Sched.pushWork q (cont b)
+            return Remove
+          Nothing -> return Keep
+          
+      -- tradeoff: we fastpath the case where the LVar is already beyond the
+      -- threshhold by polling *before* enrolling the callback.  The price is
+      -- that, if we are not currently above the threshhold, we will have to
+      -- poll *again* after enrolling the callback.  This race may also result
+      -- in the continuation being executed twice, which is permitted by
+      -- idempotence.
+          
+      pastThresh <- poll state           
+      case pastThresh of 
+        Just b -> loop (cont b) 
+        Nothing -> do
+          B.put callbacks thisCB
+          pastTresh' <- poll state -- poll again
+          case pastThresh' of
+            Just b -> loop (cont b)  -- TODO: remove callback
+            Nothing -> sched queue
 
-    Get (LVar ref _) thresh cont -> do
-      -- Tradeoff: we could do a plain read before the
-      -- atomicModifyIORef.  But that would require evaluating the
-      -- threshold function TWICE if we need to block.  (Which is
-      -- potentially more expensive than in the plain IVar case.)
-      -- e <- readIORef ref
-      let thisCB x =
---            trace ("... LVar blocked, thresh attempted "++show(hashStableName$ unsafePerformIO$ makeStableName x))
-            fmap cont $ thresh x
-      r <- atomicModifyIORef ref $ \ st@(LVarContents a ls) ->
-        case thresh a of
-          Just b  -> -- trace ("... LVar get, thresh passed ")
-                     (st, loop (cont b))
-          Nothing -> (LVarContents a (thisCB:ls), reschedule queue)
-      r
-
-    Consume (LVar ref _) cont -> do
-      -- HACK!  We know nothing about the type of state.  But we CAN
-      -- destroy it to prevent any future access:
-      a <- atomicModifyIORef ref (\(LVarContents a _) ->
-                                   (error "attempt to touch LVar after Consume operation!", a))
-      loop (cont a)
-
-    Peek (LVar ref _) cont -> do
-      LVarContents {current} <- readIORef ref     
-      loop (cont current)
-
-    Put (LVar ref cb) new tr  -> do
-      cs <- atomicModifyIORef ref $ \e -> case e of
-              LVarContents a ls ->
-                let new' = join a new
-                    (ls',woken) = loop ls [] []
-                    loop [] f w = (f,w)
-                    loop (hd:tl) f w =
-                      case hd new' of
-                        Just trc -> loop tl f (trc:w)
-                        Nothing  -> loop tl (hd:f) w
-                    -- Callbacks invoked: 
-                    woken' = case cb of
-                              Nothing -> woken
-                              Just fn -> fn a new' : woken
-                in 
-                deepseq new' (LVarContents new' ls', woken')
-      mapM_ (pushWork queue) cs
-      loop tr              
+    Put (LVar state callbacks frozen) doPut cont  -> do
+      change <- doPut state
+      case change of
+        Nothing -> loop cont   -- no change, so nothing to do
+        Just d -> do
+          isConsumed <- readIORef frozen
+          when isConsumed $ error "Attempt to change a consumed LVar"
+          B.iter callbacks $ \cb -> cb queue d
+      
+    Consume (LVar state callbacks frozen) extractor cont -> do
+      atomicallyModifyIORef frozen $ \_ -> (true, ())
+      contents <- extractor state
+      loop (cont contents)
+      
+    -- Peek (LVar ref _) cont -> do
+    --   LVarContents {current} <- readIORef ref     
+    --   loop (cont current)      
+      
+      
+  -- | NewHandlerPool (HandlerPool -> trace)
+  -- | forall a d . AddHandler HandlerPool             -- pool to enroll in
+  --                           (LVar a d)              -- LVar to listen to
+  --                           (a -> IO (Maybe Trace)) -- initial callback
+  --                           (d -> IO (Maybe Trace)) -- subsequent callbaks
+  --                           Trace                   -- continuation
+  -- | Quiesce HandlerPool Trace
+      
+    NewHandlerPool cont -> do
+      cnt <- C.new
+      cbs <- B.new
+      loop (cont (cnt, cbs))
+      
+    AddHandler (cnt, _) (LVar state callbacks frozen) poll callback cont -> do
+      let enroll Nothing  = return ()
+          enroll (Just t) = do
+            C.inc hp    -- record thread creation
+            pushWork t  -- create callback thread, which is responsible for
+                        -- recording its termination in hp
+      let thisCB q d = do
+            enroll <<= callback d
+            return Keep -- for now, always retain callback
+            
+      B.put callbacks thisCB  -- first, log the callback
+      enroll <<= poll a       -- then, poll to see whether we should launch callbacks now
+      loop cont
+      
+    Quiesce (cnt, cbs) cont -> do
+      -- todo: optimize this by checking for quiescence first?  
+      -- that's probably the less likely case, though.
+      cbs.put cont 
+      quiescent <- C.poll hp
+      if quiescent
+        then loop cont  -- todo: remove callback from bag?
+        else sched queue
+          
+    DoneHandler (cnt, cbs) -> do      
+      C.dec cnt
+      quiescent <- C.poll cnt
+      when quiescent $ do
+        B.iter cbs $ \cb -> do
+          Sched.pushWork queue cb
+          return Remove
+      sched queue
 
     Fork child parent -> do
       Sched.pushWork queue parent -- "Work-first" policy.
